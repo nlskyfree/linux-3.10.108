@@ -228,7 +228,7 @@ static void __pollwait(struct file *filp, wait_queue_head_t *wait_address,
 	entry->filp = get_file(filp);
 	entry->wait_address = wait_address;
 	entry->key = p->_key;
-	// pollwake函数指针保存到wait_queue_t中，相当于设置回调
+	// pollwake函数指针保存到wait_queue_t中，相当于设置回调，通常会由__wake_up_common响应
 	init_waitqueue_func_entry(&entry->wait, pollwake);
 	// entry->wait保存了的整个poll_wqueue指针
 	entry->wait.private = pwq;
@@ -1000,4 +1000,11 @@ SYSCALL_DEFINE5(ppoll, struct pollfd __user *, ufds, unsigned int, nfds,
 					sizeof(sigsaved));
 			set_restore_sigmask();
 		}
-		ret = -ERESTARTNOHAN
+		ret = -ERESTARTNOHAND;
+	} else if (sigmask)
+		sigprocmask(SIG_SETMASK, &sigsaved, NULL);
+
+	ret = poll_select_copy_remaining(&end_time, tsp, 0, ret);
+
+	return ret;
+}

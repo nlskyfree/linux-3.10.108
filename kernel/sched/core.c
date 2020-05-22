@@ -1492,7 +1492,9 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * set_current_state() the waiting thread does.
 	 */
 	smp_mb__before_spinlock();
+	// 关闭本地中断
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	// 进程状态判断
 	if (!(p->state & state))
 		goto out;
 
@@ -1521,6 +1523,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * current.
 	 */
 	smp_rmb();
+	// 若当前进程已在running queue中，则无需唤醒
 	if (p->on_rq && ttwu_remote(p, wake_flags))
 		goto stat;
 
@@ -1567,7 +1570,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		set_task_cpu(p, cpu);
 	}
 #endif /* CONFIG_SMP */
-
+	// 获取此CPU的RUNNING QUEUE，将进行加入RUNNING QUEUE
 	ttwu_queue(p, cpu);
 stat:
 	ttwu_stat(p, cpu, wake_flags);
@@ -3210,10 +3213,15 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
 			int nr_exclusive, int wake_flags, void *key)
 {
 	wait_queue_t *curr, *next;
-
+	// 遍历等待队列
 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
 		unsigned flags = curr->flags;
-
+		// 1、调用列表项的唤醒函数，成功唤醒返回1，失败返回0
+		// 2、判断当前进程是否以互斥形式唤醒。是互斥形式则返回1；否则返回0；
+		// 3、nr_exclusive为需要唤醒的互斥进程的数量。
+		// 等待队列中前面均是非互斥进程，后面才是互斥进程。因此，唤醒函数总先唤醒全部的非互斥进程。
+		// 因为当__wake_up_commom函数每一次去判断if语时，总会“不自觉”去执行默认的唤醒函数（除非唤醒失败，那么会退出遍历宏）
+		// 当全部的非互斥进程被唤醒后，第二个判断条件也就成立了。因此__wake_up_commom函数会依次唤醒nr_exclusive个互斥
 		if (curr->func(curr, mode, wake_flags, key) &&
 				(flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
 			break;

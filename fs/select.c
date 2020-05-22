@@ -142,14 +142,16 @@ void poll_freewait(struct poll_wqueues *pwq)
 	while (p) {
 		struct poll_table_entry * entry;
 		struct poll_table_page *old;
-
+		// 释放一页的所有poll_table_entry
 		entry = p->entry;
 		do {
+			// 释放poll_table_page里的所有poll_table_entry
 			entry--;
 			free_poll_entry(entry);
 		} while (entry > p->entries);
 		old = p;
 		p = p->next;
+		// 页内存释放
 		free_page((unsigned long) old);
 	}
 }
@@ -158,7 +160,7 @@ EXPORT_SYMBOL(poll_freewait);
 static struct poll_table_entry *poll_get_entry(struct poll_wqueues *p)
 {
 	struct poll_table_page *table = p->table;
-
+	// 先用一个内置数组分配poll_table_entry，满了再分配poll_table_page
 	if (p->inline_index < N_INLINE_POLL_ENTRIES)
 		return p->inline_entries + p->inline_index++;
 
@@ -182,6 +184,7 @@ static struct poll_table_entry *poll_get_entry(struct poll_wqueues *p)
 static int __pollwake(wait_queue_t *wait, unsigned mode, int sync, void *key)
 {
 	struct poll_wqueues *pwq = wait->private;
+	// 创建名称为dummy_wait的等待队列项wait_queue_t，并将current进程PCB存放到队列项private中
 	DECLARE_WAITQUEUE(dummy_wait, pwq->polling_task);
 
 	/*
@@ -202,6 +205,7 @@ static int __pollwake(wait_queue_t *wait, unsigned mode, int sync, void *key)
 	 * pass in @sync.  @sync is scheduled to be removed and once
 	 * that happens, wake_up_process() can be used directly.
 	 */
+	// 唤醒进程
 	return default_wake_function(&dummy_wait, mode, sync, key);
 }
 
@@ -242,6 +246,7 @@ int poll_schedule_timeout(struct poll_wqueues *pwq, int state,
 	int rc = -EINTR;
 
 	set_current_state(state);
+	// wakeup后会设置为1
 	if (!pwq->triggered)
 		rc = schedule_hrtimeout_range(expires, slack, HRTIMER_MODE_ABS);
 	__set_current_state(TASK_RUNNING);

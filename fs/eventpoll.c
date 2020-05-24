@@ -1016,6 +1016,12 @@ static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *k
 	 * semantics). All the events that happen during that period of time are
 	 * chained in ep->ovflist and requeued later on.
 	 */
+	/* 如果该callback被调用的同时, epoll_wait()已经返回了,
+     * 也就是说, 此刻应用程序有可能已经在循环获取events,
+     * 这种情况下, 内核将此刻发生event的epitem用一个单独的链表
+     * 链起来, 不发给应用程序, 也不丢弃, 而是在下一次epoll_wait
+     * 时返回给用户.
+     */
 	if (unlikely(ep->ovflist != EP_UNACTIVE_PTR)) {
 		if (epi->next == EP_UNACTIVE_PTR) {
 			epi->next = ep->ovflist;
@@ -1034,6 +1040,7 @@ static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *k
 
 	/* If this file is already in the ready list we exit soon */
 	if (!ep_is_linked(&epi->rdllink)) {
+		// ipitem加入ep的read list
 		list_add_tail(&epi->rdllink, &ep->rdllist);
 		ep_pm_stay_awake_rcu(epi);
 	}
@@ -1042,7 +1049,9 @@ static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *k
 	 * Wake up ( if active ) both the eventpoll wait list and the ->poll()
 	 * wait list.
 	 */
+	// 等待队列不为空
 	if (waitqueue_active(&ep->wq))
+		// 这里调用__wake_up_common唤醒epoll_wait进程
 		wake_up_locked(&ep->wq);
 	if (waitqueue_active(&ep->poll_wait))
 		pwake++;
@@ -1061,18 +1070,24 @@ out_unlock:
  * This is the callback that is used to add our wait queue to the
  * target file wakeup lists.
  */
+// 对某个fd poll时调用（select是调用__pollwait）
 static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 				 poll_table *pt)
 {
+	// 通过poll_table和epi封装的一个结构体epq找到epitem
 	struct epitem *epi = ep_item_from_epqueue(pt);
 	struct eppoll_entry *pwq;
-
+	// 从系统初始化创建的对象池中获取一个eppoll_entry
 	if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
+		// 等待队列项的回调函数设置为ep_poll_callback
 		init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
 		pwq->whead = whead;
 		pwq->base = epi;
+		// 将eppoll_entry加入fd对应的设备等待队列中
 		add_wait_queue(whead, &pwq->wait);
+		// 将此pwq记录到epi的链表中
 		list_add_tail(&pwq->llink, &epi->pwqlist);
+		// nwait记录了当前epitem加入到了多少个等待队列中
 		epi->nwait++;
 	} else {
 		/* We have to signal that an error occurred */
@@ -1242,6 +1257,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	long user_watches;
 	// 创建一个epitem结构
 	struct epitem *epi;
+	// 封装了epitem和poll_table
 	struct ep_pqueue epq;
 
 	user_watches = atomic_long_read(&ep->user->epoll_watches);
@@ -1271,8 +1287,9 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	}
 
 	/* Initialize the poll table using the queue callback */
-	// 类似于select/poll的poll_wqueues，内部存储了poll_table，poll_table定义了回调函数
+	// epq封装了poll_table和epitem
 	epq.epi = epi;
+	// poll_table绑定了ep_ptable_queue_proc，这样设备驱动在poll中可以调用此函数
 	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
 
 	/*
@@ -1619,6 +1636,7 @@ fetch_events:
 		 * ep_poll_callback() when events will become available.
 		 */
 		init_waitqueue_entry(&wait, current);
+		// 记录到ep的wait queue，当ep_poll_callback回调函数调用时，会唤醒此等待队列上的epoll_wait
 		__add_wait_queue_exclusive(&ep->wq, &wait);
 
 		for (;;) {

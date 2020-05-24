@@ -371,6 +371,7 @@ static void ep_nested_calls_init(struct nested_calls *ncalls)
  */
 static inline int ep_events_available(struct eventpoll *ep)
 {
+	// rdllist、ovflist都存有已发生的事件
 	return !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
 }
 
@@ -609,6 +610,7 @@ static int ep_scan_ready_list(struct eventpoll *ep,
 	 * in a lockless way.
 	 */
 	spin_lock_irqsave(&ep->lock, flags);
+	// 清空rdlist，将里面的epitem拷贝到txlist链表
 	list_splice_init(&ep->rdllist, &txlist);
 	ep->ovflist = NULL;
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -616,6 +618,7 @@ static int ep_scan_ready_list(struct eventpoll *ep,
 	/*
 	 * Now call the callback function.
 	 */
+	// 这里就是调用 ep_send_events_proc 函数
 	error = (*sproc)(ep, &txlist, priv);
 
 	spin_lock_irqsave(&ep->lock, flags);
@@ -1268,6 +1271,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	}
 
 	/* Initialize the poll table using the queue callback */
+	// 类似于select/poll的poll_wqueues，内部存储了poll_table，poll_table定义了回调函数
 	epq.epi = epi;
 	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
 
@@ -1278,6 +1282,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	 * this operation completes, the poll callback can start hitting
 	 * the new item.
 	 */
+	// 内部调用了tfile的poll operation并判断关注的事件是否发生
 	revents = ep_item_poll(epi, &epq.pt);
 
 	/*
@@ -1291,6 +1296,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 
 	/* Add the current item to the list of active epoll hook for this file */
 	spin_lock(&tfile->f_lock);
+	// 将epitem插入到文件的f_ep_links链表  
 	list_add_tail(&epi->fllink, &tfile->f_ep_links);
 	spin_unlock(&tfile->f_lock);
 
@@ -1298,6 +1304,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	 * Add the current item to the RB tree. All RB tree operations are
 	 * protected by "mtx", and ep_insert() is called with "mtx" held.
 	 */
+	// 将此epitem插入红黑树
 	ep_rbtree_insert(ep, epi);
 
 	/* now check if we've created too many backpaths */
@@ -1309,12 +1316,16 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	spin_lock_irqsave(&ep->lock, flags);
 
 	/* If the file is already "ready" we drop it inside the ready list */
+	// 当有事件发生，并且epitem不在就绪列表中ep->rdllist，则加入就绪列表
 	if ((revents & event->events) && !ep_is_linked(&epi->rdllink)) {
+		// 插入就绪列表
 		list_add_tail(&epi->rdllink, &ep->rdllist);
 		ep_pm_stay_awake(epi);
 
 		/* Notify waiting tasks that events are available */
+		// 
 		if (waitqueue_active(&ep->wq))
+		// 这里就是调用了__wake_up_common，唤醒sys_epoll_wait等待队列
 			wake_up_locked(&ep->wq);
 		if (waitqueue_active(&ep->poll_wait))
 			pwake++;
@@ -1335,7 +1346,7 @@ error_remove_epi:
 	if (ep_is_linked(&epi->fllink))
 		list_del_init(&epi->fllink);
 	spin_unlock(&tfile->f_lock);
-
+	// 从红黑树上删除节点
 	rb_erase(&epi->rbn, &ep->rbr);
 
 error_unregister:
@@ -1456,8 +1467,10 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 	 * Items cannot vanish during the loop because ep_scan_ready_list() is
 	 * holding "mtx" during this call.
 	 */
+	// 扫描之前构建的txlist
 	for (eventcnt = 0, uevent = esed->events;
 	     !list_empty(head) && eventcnt < esed->maxevents;) {
+		// 取出第一个
 		epi = list_first_entry(head, struct epitem, rdllink);
 
 		/*
@@ -1475,9 +1488,13 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 				__pm_stay_awake(ep->ws);
 			__pm_relax(ws);
 		}
-
+		// 从链表中删除这个节点
 		list_del_init(&epi->rdllink);
-
+		/* 调用设备驱动poll读取events, 
+         * 注意events我们ep_poll_callback()里面已经取过一次了, 为啥还要再取?
+         * 1. 希望能拿到此刻的最新数据, events是会变的
+         * 2. 不是所有的poll实现, 都通过等待队列传递了events, 有可能某些驱动压根没传
+		 */
 		revents = ep_item_poll(epi, &pt);
 
 		/*
@@ -1487,6 +1504,7 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 		 * can change the item.
 		 */
 		if (revents) {
+			// 拷贝数据到用户空间
 			if (__put_user(revents, &uevent->events) ||
 			    __put_user(epi->event.data, &uevent->data)) {
 				list_add(&epi->rdllink, head);
@@ -1509,6 +1527,14 @@ static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
 				 * ep_scan_ready_list() holding "mtx" and the
 				 * poll callback will queue them in ep->ovflist.
 				 */
+				/* LT水平触发，就再次将epitem插入回eventpoll的read链表
+				 * 不管你还有没有有效的事件或者数据,
+                 * 都会被重新插入到ready list, 再下一次epoll_wait
+                 * 时, 会立即返回, 并通知给用户空间. 当然如果这个
+                 * 被监听的fds确实没事件也没数据了, epoll_wait会返回一个0,
+                 * 空转一次
+				 * ET边缘触发，不会再次进入队列，除非状态发生变化，ep_poll_callback被调用
+				 */ 
 				list_add_tail(&epi->rdllink, &ep->rdllist);
 				ep_pm_stay_awake(epi);
 			}
@@ -1584,7 +1610,8 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 
 fetch_events:
 	spin_lock_irqsave(&ep->lock, flags);
-
+	// 这里可以看到，有事件发生时只需要检查链表是否为空，无需O(n)次遍历
+	// 若eventpoll上没有event发生，进行sleep阻塞调用者
 	if (!ep_events_available(ep)) {
 		/*
 		 * We don't have any available event to return to the caller.
@@ -1601,6 +1628,7 @@ fetch_events:
 			 * to TASK_INTERRUPTIBLE before doing the checks.
 			 */
 			set_current_state(TASK_INTERRUPTIBLE);
+			// 有事件发生或者超时则返回，可以看到被唤醒后，也是O(1)的检查时间
 			if (ep_events_available(ep) || timed_out)
 				break;
 			if (signal_pending(current)) {
@@ -1609,6 +1637,7 @@ fetch_events:
 			}
 
 			spin_unlock_irqrestore(&ep->lock, flags);
+			// 休眠一段时间，等待timeout或被唤醒
 			if (!schedule_hrtimeout_range(to, slack, HRTIMER_MODE_ABS))
 				timed_out = 1;
 
@@ -1620,6 +1649,7 @@ fetch_events:
 	}
 check_events:
 	/* Is it worth to try to dig for events ? */
+	// 重新获取了一次事件
 	eavail = ep_events_available(ep);
 
 	spin_unlock_irqrestore(&ep->lock, flags);
@@ -1629,6 +1659,7 @@ check_events:
 	 * there's still timeout left over, we go trying again in search of
 	 * more luck.
 	 */
+	// ep_send_events拷贝数据到用户空间中，即events作为返回值
 	if (!res && eavail &&
 	    !(res = ep_send_events(ep, events, maxevents)) && !timed_out)
 		goto fetch_events;
@@ -1978,6 +2009,7 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
 	ep = f.file->private_data;
 
 	/* Time to fish for events ... */
+	// 上面全是参数校验，这里是核心逻辑
 	error = ep_poll(ep, events, maxevents, timeout);
 
 error_fput:

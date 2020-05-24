@@ -137,6 +137,7 @@ void poll_freewait(struct poll_wqueues *pwq)
 {
 	struct poll_table_page * p = pwq->table;
 	int i;
+	// 先释放栈上内部数组（数据量小的时候不用分配堆内存）
 	for (i = 0; i < pwq->inline_index; i++)
 		free_poll_entry(pwq->inline_entries + i);
 	while (p) {
@@ -502,7 +503,7 @@ int do_select(int n, fd_set_bits *fds, struct timespec *end_time)
 			cond_resched();
 		}
 		wait->_qproc = NULL;
-		// 只要有1个事件（retval>0）或超时了就break，否则挂起当前进程
+		// 只要有1个事件（retval>0）或超时了就break
 		if (retval || timed_out || signal_pending(current))
 			break;
 		if (table.error) {
@@ -520,9 +521,10 @@ int do_select(int n, fd_set_bits *fds, struct timespec *end_time)
 			to = &expire;
 		}
 
-		// 
+		// 休眠一段时间，等待唤醒
 		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE,
 					   to, slack))
+			// 超时返回则记录已超时标志
 			timed_out = 1;
 	}
 
@@ -569,6 +571,7 @@ int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 	 * long-words. 
 	 */
 	// 3个位图记录输入的fd，3个位图记录触发了事件的fd，返回给调用者
+	// 先尝试在栈上分配内存，过大时，进行堆内存分配
 	size = FDS_BYTES(n);
 	bits = stack_fds;
 	if (size > sizeof(stack_fds) / 6) {
@@ -759,13 +762,16 @@ static inline unsigned int do_pollfd(struct pollfd *pollfd, poll_table *pwait)
 			mask = DEFAULT_POLLMASK;
 			if (f.file->f_op && f.file->f_op->poll) {
 				pwait->_key = pollfd->events|POLLERR|POLLHUP;
+				// 核心是这块，与select一样，遍历fd拿到io事件或加入设备等待队列
 				mask = f.file->f_op->poll(f.file, pwait);
 			}
 			/* Mask out unneeded events. */
+			// 记录关注并且发生了的IO事件
 			mask &= pollfd->events | POLLERR | POLLHUP;
 			fdput(f);
 		}
 	}
+	// revent记录结果
 	pollfd->revents = mask;
 
 	return mask;
@@ -790,12 +796,13 @@ static int do_poll(unsigned int nfds,  struct poll_list *list,
 
 	for (;;) {
 		struct poll_list *walk;
-
+		// 遍历链表上的每一页内存
 		for (walk = list; walk != NULL; walk = walk->next) {
 			struct pollfd * pfd, * pfd_end;
 
 			pfd = walk->entries;
 			pfd_end = pfd + walk->len;
+			// 一页内存中的每一项遍历
 			for (; pfd != pfd_end; pfd++) {
 				/*
 				 * Fish for events. If we found one, record it
@@ -854,17 +861,18 @@ int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 	struct poll_list *const head = (struct poll_list *)stack_pps;
  	struct poll_list *walk = head;
  	unsigned long todo = nfds;
-
+	// 判断是否超过进程允许打开的文件描述符数目
 	if (nfds > rlimit(RLIMIT_NOFILE))
 		return -EINVAL;
 
+	// 与select的用户态位图存储传入内核不同，poll内核内部组装了一个poll链表来存储fd
 	len = min_t(unsigned int, nfds, N_STACK_PPS);
 	for (;;) {
 		walk->next = NULL;
 		walk->len = len;
 		if (!len)
 			break;
-
+		// 从用户态拷贝一页内存到内核态
 		if (copy_from_user(walk->entries, ufds + nfds-todo,
 					sizeof(struct pollfd) * walk->len))
 			goto out_fds;
@@ -872,7 +880,7 @@ int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 		todo -= walk->len;
 		if (!todo)
 			break;
-
+		// 链表管理堆上分配的内存
 		len = min(todo, POLLFD_PER_PAGE);
 		size = sizeof(struct poll_list) + sizeof(struct pollfd) * len;
 		walk = walk->next = kmalloc(size, GFP_KERNEL);
@@ -881,9 +889,10 @@ int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 			goto out_fds;
 		}
 	}
-
+	// 和select一样，初始化poll_wqueues
 	poll_initwait(&table);
 	fdcount = do_poll(nfds, head, &table, end_time);
+	// 和select一样，释放poll_wqueues
 	poll_freewait(&table);
 
 	for (walk = head; walk; walk = walk->next) {
@@ -897,6 +906,7 @@ int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 
 	err = fdcount;
 out_fds:
+	// 跟select相比，内核多组织了一个poll_list结构，这里也需要释放掉
 	walk = head->next;
 	while (walk) {
 		struct poll_list *pos = walk;

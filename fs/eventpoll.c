@@ -942,11 +942,14 @@ static struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
 	int kcmp;
 	struct rb_node *rbp;
 	struct epitem *epi, *epir = NULL;
+	// 组装ffd作为key，其实就是file*和fd的结构体
 	struct epoll_filefd ffd;
-
 	ep_set_ffd(&ffd, file, fd);
+	// 二分搜索红黑树
 	for (rbp = ep->rbr.rb_node; rbp; ) {
-		epi = rb_entry(rbp, struct epitem, rbn);
+		// 就是调用containerof，找到对应的container结构体
+		epi = rb_entry(rbp, struct epitem, rbn); 
+		// 比较下file和fd，判断搜索路线
 		kcmp = ep_cmp_ffd(&ffd, &epi->ffd);
 		if (kcmp > 0)
 			rbp = rbp->rb_right;
@@ -1234,6 +1237,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	int error, revents, pwake = 0;
 	unsigned long flags;
 	long user_watches;
+	// 创建一个epitem结构
 	struct epitem *epi;
 	struct ep_pqueue epq;
 
@@ -1244,11 +1248,14 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 		return -ENOMEM;
 
 	/* Item initialization follow here ... */
+	// 初始化epitem上面的三个链表
 	INIT_LIST_HEAD(&epi->rdllink);
 	INIT_LIST_HEAD(&epi->fllink);
 	INIT_LIST_HEAD(&epi->pwqlist);
 	epi->ep = ep;
+	// 初始化epitem上的epoll_filefd结构体（红黑树的key）
 	ep_set_ffd(&epi->ffd, tfile, fd);
+	// 关注的事件
 	epi->event = *event;
 	epi->nwait = 0;
 	epi->next = EP_UNACTIVE_PTR;
@@ -1743,6 +1750,7 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 	/*
 	 * Create the internal data structure ("struct eventpoll").
 	 */
+	// 初始化eventpoll数据结构
 	error = ep_alloc(&ep);
 	if (error < 0)
 		return error;
@@ -1750,11 +1758,14 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 	 * Creates all the items needed to setup an eventpoll file. That is,
 	 * a file structure and a free file descriptor.
 	 */
+	// 获取一个没有使用的fd，作为epollfd
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
 		error = fd;
 		goto out_free_ep;
 	}
+	// 为这个epollfd创建一个匿名的struct file，再提供一个假的File Operation驱动实现
+	// 在file的private字段上绑定eventpoll结构的实例ep
 	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep,
 				 O_RDWR | (flags & O_CLOEXEC));
 	if (IS_ERR(file)) {
@@ -1763,6 +1774,7 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 	}
 	ep->file = file;
 	fd_install(fd, file);
+	// 返回epollfd
 	return fd;
 
 out_free_fd:
@@ -1774,6 +1786,7 @@ out_free_ep:
 
 SYSCALL_DEFINE1(epoll_create, int, size)
 {
+	// 可见epoll_create传入的size目前没有意义
 	if (size <= 0)
 		return -EINVAL;
 
@@ -1785,6 +1798,10 @@ SYSCALL_DEFINE1(epoll_create, int, size)
  * the eventpoll file that enables the insertion/removal/change of
  * file descriptors inside the interest set.
  */
+// epfd 表示epoll_create创建的epollfd；
+// op 表示本次控制操作时什么，有EPOLL_CTL_ADD,EPOLL_CTL_MOD,EPOLL_CTL_DEL，
+// fd 是需要监听的描述符
+// event 对这个fd感兴趣的events
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
@@ -1793,9 +1810,11 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	struct file *file, *tfile;
 	struct eventpoll *ep;
 	struct epitem *epi;
+	// 用户存储从用户空间拷贝的epoll事件
 	struct epoll_event epds;
 
 	error = -EFAULT;
+	// ep_op_has_event就是判断是否删除操作，不是删除就从用户态把关注的事件数据拷贝到内核地址空间
 	if (ep_op_has_event(op) &&
 	    copy_from_user(&epds, event, sizeof(struct epoll_event)))
 		goto error_return;
@@ -1825,6 +1844,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	 * the user passed to us _is_ an eventpoll file. And also we do not permit
 	 * adding an epoll file descriptor inside itself.
 	 */
+	// 不允许添加的epollfd和待添加的fd对应的file是一个，不允许file不是epoll伪造的file
 	error = -EINVAL;
 	if (file == tfile || !is_file_epoll(file))
 		goto error_tgt_fput;
@@ -1833,6 +1853,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	 * At this point it is safe to assume that the "private_data" contains
 	 * our own data structure.
 	 */
+	// epoll file的private字段存储了eventpoll结构（调用epoll_create时初始化并存储file）
 	ep = file->private_data;
 
 	/*
@@ -1847,11 +1868,13 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	 * b/c we want to make sure we are looking at a coherent view of
 	 * epoll network.
 	 */
+	// ADD和DEL需要加锁操作
 	if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL) {
 		mutex_lock(&epmutex);
 		did_lock_epmutex = 1;
 	}
 	if (op == EPOLL_CTL_ADD) {
+		// 目标文件是另外一个epoll file文件的情况
 		if (is_file_epoll(tfile)) {
 			error = -ELOOP;
 			if (ep_loop_check(ep, tfile) != 0) {
@@ -1859,6 +1882,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 				goto error_tgt_fput;
 			}
 		} else
+			// 将目标文件添加到epoll全局的tfile_check_list双向链表中 
 			list_add(&tfile->f_tfile_llink, &tfile_check_list);
 	}
 
@@ -1869,15 +1893,19 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	 * above, we can be sure to be able to use the item looked up by
 	 * ep_find() till we release the mutex.
 	 */
+	// 在红黑树中查找epitem
 	epi = ep_find(ep, tfile, fd);
 
 	error = -EINVAL;
 	switch (op) {
 	case EPOLL_CTL_ADD:
 		if (!epi) {
+			// 添加POLLERR、POLLHUP事件
 			epds.events |= POLLERR | POLLHUP;
+			
 			error = ep_insert(ep, &epds, tfile, fd);
 		} else
+			// epitem存在，说明已有了，返回错误信息
 			error = -EEXIST;
 		clear_tfile_check_list();
 		break;
@@ -1885,6 +1913,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		if (epi)
 			error = ep_remove(ep, epi);
 		else
+			// 对不存在的epitem调用删除操作，返回错误信息
 			error = -ENOENT;
 		break;
 	case EPOLL_CTL_MOD:
@@ -1892,6 +1921,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 			epds.events |= POLLERR | POLLHUP;
 			error = ep_modify(ep, epi, &epds);
 		} else
+			// 对不存在的epitem调用更新操作，返回错误信息
 			error = -ENOENT;
 		break;
 	}
@@ -2044,7 +2074,7 @@ COMPAT_SYSCALL_DEFINE6(epoll_pwait, int, epfd,
 	return err;
 }
 #endif
-
+// __init标记此段代码在内核启动时运行一次
 static int __init eventpoll_init(void)
 {
 	struct sysinfo si;
@@ -2053,10 +2083,13 @@ static int __init eventpoll_init(void)
 	/*
 	 * Allows top 4% of lomem to be allocated for epoll watches (per user).
 	 */
+	// lomem指内核的低地址空间，也就是这里每个用户最大监听的fd依赖于内核内存大小 
 	max_user_watches = (((si.totalram - si.totalhigh) / 25) << PAGE_SHIFT) /
 		EP_ITEM_COST;
+	// 断言，满足则抛出异常
 	BUG_ON(max_user_watches < 0);
 
+	// 初始化了3个双向链表
 	/*
 	 * Initialize the structure used to perform epoll file descriptor
 	 * inclusion loops checks.
@@ -2075,6 +2108,7 @@ static int __init eventpoll_init(void)
 	 */
 	BUILD_BUG_ON(sizeof(void *) <= 8 && sizeof(struct epitem) > 128);
 
+	// 调用slab创建2个对象的内存池，提升分配效率
 	/* Allocates slab cache used to allocate "struct epitem" items */
 	epi_cache = kmem_cache_create("eventpoll_epi", sizeof(struct epitem),
 			0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);

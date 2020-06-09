@@ -1040,7 +1040,7 @@ static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *k
 
 	/* If this file is already in the ready list we exit soon */
 	if (!ep_is_linked(&epi->rdllink)) {
-		// ipitem加入ep的read list
+		// 核心代码，socket IO事件发生时将ipitem加入ep的ready list
 		list_add_tail(&epi->rdllink, &ep->rdllist);
 		ep_pm_stay_awake_rcu(epi);
 	}
@@ -1079,7 +1079,7 @@ static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 	struct eppoll_entry *pwq;
 	// 从系统初始化创建的对象池中获取一个eppoll_entry
 	if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
-		// 等待队列项的回调函数设置为ep_poll_callback
+		// 等待队列项的回调函数设置为ep_poll_callback，即socket IO发生时的回调函数
 		init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
 		pwq->whead = whead;
 		pwq->base = epi;
@@ -1289,7 +1289,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	/* Initialize the poll table using the queue callback */
 	// epq封装了poll_table和epitem
 	epq.epi = epi;
-	// poll_table绑定了ep_ptable_queue_proc，这样设备驱动在poll中可以调用此函数
+	// poll_table绑定了ep_ptable_queue_proc，说明设备驱动poll函数实际调用此函数
 	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
 
 	/*
@@ -1627,7 +1627,7 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 
 fetch_events:
 	spin_lock_irqsave(&ep->lock, flags);
-	// 这里可以看到，有事件发生时只需要检查链表是否为空，无需O(n)次遍历
+	// 这里可以看到，有事件发生时只需要检查ep->rdllist就绪链表是否为空，无需O(n)次遍历
 	// 若eventpoll上没有event发生，进行sleep阻塞调用者
 	if (!ep_events_available(ep)) {
 		/*
@@ -1635,8 +1635,10 @@ fetch_events:
 		 * We need to sleep here, and we will be wake up by
 		 * ep_poll_callback() when events will become available.
 		 */
+		// 初始化等待队列链表项
 		init_waitqueue_entry(&wait, current);
-		// 记录到ep的wait queue，当ep_poll_callback回调函数调用时，会唤醒此等待队列上的epoll_wait
+		// 记录到epfd的wait queue（注意这里和select/poll的区别，不再挂载到socket的等待队列上）
+		// 当ep_poll_callback回调函数调用时，会唤醒此等待队列上的epoll_wait
 		__add_wait_queue_exclusive(&ep->wq, &wait);
 
 		for (;;) {
